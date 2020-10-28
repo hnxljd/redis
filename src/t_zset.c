@@ -130,53 +130,69 @@ int zslRandomLevel(void) {
  * exist (up to the caller to enforce that). The skiplist takes ownership
  * of the passed SDS string 'ele'. */
 zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
-    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    unsigned int rank[ZSKIPLIST_MAXLEVEL];
-    int i, level;
+    /* 插入节点时，需要更新被插入节点每层的前一个节点
+     * 由于每层更新的节点不一样，所以将每层需要更新的节点记录在update[i]中 */
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL];
 
-    serverAssert(!isnan(score));
+    /* 记录当前层从header节点到update[i]节点所经历的步长
+     * 在更新update[i]的span和设置新插入节点的span时用到 */
+    unsigned int rank[ZSKIPLIST_MAXLEVEL];
+
+    zskiplistNode *x;
     x = zsl->header;
-    for (i = zsl->level-1; i >= 0; i--) {
-        /* store rank that is crossed to reach the insert position */
-        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+    int skipListLevelBeforeInsert = zsl->level;
+    /* 找到各存储层级的插入位，并记录该节点的 span */
+    for (int i = skipListLevelBeforeInsert - 1; i >= 0; i--) {
+        rank[i] = i == (skipListLevelBeforeInsert - 1) ? 0 : rank[i + 1];
+
+        /* 找到 x 的下一个节点 */
         while (x->level[i].forward &&
-                (x->level[i].forward->score < score ||
-                    (x->level[i].forward->score == score &&
-                    sdscmp(x->level[i].forward->ele,ele) < 0)))
-        {
+               (x->level[i].forward->score < score ||
+                (x->level[i].forward->score == score && sdscmp(x->level[i].forward->ele, ele) < 0))) {
             rank[i] += x->level[i].span;
             x = x->level[i].forward;
         }
         update[i] = x;
     }
-    /* we assume the element is not already inside, since we allow duplicated
-     * scores, reinserting the same element should never happen since the
-     * caller of zslInsert() should test in the hash table if the element is
-     * already inside or not. */
-    level = zslRandomLevel();
-    if (level > zsl->level) {
-        for (i = zsl->level; i < level; i++) {
+
+    /* 原注释：我们假定该元素尚未在内部，并且允许重复的分数
+     * 这里永远不会重新插入同一元素，因为 zslInsert() 的调用者应在哈希表中测试该元素是否已在内部
+     * =======
+     * 如果需要插入的 level > 跳表 level，为之前不存在的 level 填充 update 和 rank
+     * update 相当于是头结点，rank 为 0，span 相当于跨越了所有元素 */
+    int level4Insert = zslRandomLevel();
+    if (level4Insert > skipListLevelBeforeInsert) {
+        for (int i = skipListLevelBeforeInsert; i < level4Insert; i++) {
             rank[i] = 0;
             update[i] = zsl->header;
             update[i]->level[i].span = zsl->length;
         }
-        zsl->level = level;
+        zsl->level = level4Insert;
     }
-    x = zslCreateNode(level,score,ele);
-    for (i = 0; i < level; i++) {
+
+    x = zslCreateNode(level4Insert, score, ele);
+    for (int i = 0; i < level4Insert; i++) {
+        /* 替换节点后驱 */
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
 
-        /* update span covered by update[i] as x is inserted here */
-        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
-        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+        /* 待插入节点为 x, update[i] 为 x 在 i 层前一节点
+         * rank[0] = 最下层前一节点到 header 的距离, rank[i] = update[i] 到 header 的距离
+         * 更新时, x 和 当前层前一节点之间的距离, distance_x_and_update_node_before_update = rank[0] - rank[i] + 1
+         * distance_x_next = update[i].span - distance_x_and_update_node_before_update - 1
+         * => x.level[i].span = update[i].span - distance_x_update_i
+         * => update.level[i].span = distance_x_and_update_node_before_update */
+        unsigned int distanceBeforeUpdateBetweenXAndCurrentLevelPrevNode = rank[0] - rank[i] + 1;
+        x->level[i].span = update[i]->level[i].span - distanceBeforeUpdateBetweenXAndCurrentLevelPrevNode - 1;
+        update[i]->level[i].span = distanceBeforeUpdateBetweenXAndCurrentLevelPrevNode;
     }
 
-    /* increment span for untouched levels */
-    for (i = level; i < zsl->level; i++) {
+    /* 为之前不存在的level 增加 span */
+    for (int i = level4Insert; i < skipListLevelBeforeInsert; i++) {
         update[i]->level[i].span++;
     }
 
+    /* 更新前驱 */
     x->backward = (update[0] == zsl->header) ? NULL : update[0];
     if (x->level[0].forward)
         x->level[0].forward->backward = x;
