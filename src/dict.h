@@ -86,12 +86,16 @@ typedef struct dict {
  * iterating. Otherwise it is a non safe iterator, and only dictNext()
  * should be called while iterating. */
 typedef struct dictIterator {
-    dict *d;
-    long index;
+    dict *d; // 迭代的字典
+    long index; // 当前指向的索引值
+
+    /* 两个标志位, table 表示是 ht[0/1]在迭代, safe 表示是否安全迭代器
+     * 1. 普通迭代器迭代开始和迭代完后会计算校验指纹保证数据完整
+     * 2. 安全迭代器迭代时不进行 rehash, 以此保证数据不被重复遍历 */
     int table, safe;
-    dictEntry *entry, *nextEntry;
+    dictEntry *entry, *nextEntry; // entry 是指向的节点,  next 是下一个节点, 删除时需要
     /* unsafe iterator fingerprint for misuse detection. */
-    long long fingerprint;
+    long long fingerprint; // 字典指纹
 } dictIterator;
 
 typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
