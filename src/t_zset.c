@@ -130,7 +130,12 @@ int zslRandomLevel(void) {
  * exist (up to the caller to enforce that). The skiplist takes ownership
  * of the passed SDS string 'ele'. */
 zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    /* 插入节点时，需要更新被插入节点每层的前一个节点
+     * 由于每层更新的节点不一样，所以将每层需要更新的节点记录在update[i]中 */
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+
+    /* 记录当前层从header节点到update[i]节点所经历的步长
+     * 在更新update[i]的span和设置新插入节点的span时用到 */
     unsigned int rank[ZSKIPLIST_MAXLEVEL];
     int i, level;
 
@@ -138,7 +143,9 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
         /* store rank that is crossed to reach the insert position */
+        /* 找到各存储层级的插入位，并记录该节点的 span */
         rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+        /* 找到 x 的下一个节点 */
         while (x->level[i].forward &&
                 (x->level[i].forward->score < score ||
                     (x->level[i].forward->score == score &&
@@ -149,10 +156,11 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
         }
         update[i] = x;
     }
-    /* we assume the element is not already inside, since we allow duplicated
-     * scores, reinserting the same element should never happen since the
-     * caller of zslInsert() should test in the hash table if the element is
-     * already inside or not. */
+    /* 原注释：我们假定该元素尚未在内部，并且允许重复的分数
+     * 这里永远不会重新插入同一元素，因为 zslInsert() 的调用者应在哈希表中测试该元素是否已在内部
+     * =======
+     * 如果需要插入的 level > 跳表 level，为之前不存在的 level 填充 update 和 rank
+     * update 相当于是头结点，rank 为 0，span 相当于跨越了所有元素 */
     level = zslRandomLevel();
     if (level > zsl->level) {
         for (i = zsl->level; i < level; i++) {
@@ -164,19 +172,26 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
     }
     x = zslCreateNode(level,score,ele);
     for (i = 0; i < level; i++) {
+        /* 逐层替换节点后驱 */
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
 
-        /* update span covered by update[i] as x is inserted here */
+        /* 待插入节点为 x, update[i] 为 x 在 i 层前一节点
+         * rank[0] = 最下层前一节点到 header 的距离, rank[i] = update[i] 到 header 的距离
+         * 更新时, x 和 当前层前一节点之间的距离, distance_x_and_update_node_before_update = rank[0] - rank[i] + 1
+         * distance_x_next = update[i].span - distance_x_and_update_node_before_update - 1
+         * => x.level[i].span = update[i].span - distance_x_update_i
+         * => update.level[i].span = distance_x_and_update_node_before_update */
         x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
         update[i]->level[i].span = (rank[0] - rank[i]) + 1;
     }
 
-    /* increment span for untouched levels */
+    /* 为之前不存在的level 增加 span */
     for (i = level; i < zsl->level; i++) {
         update[i]->level[i].span++;
     }
 
+    /* 更新前驱 */
     x->backward = (update[0] == zsl->header) ? NULL : update[0];
     if (x->level[0].forward)
         x->level[0].forward->backward = x;
@@ -1354,11 +1369,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
 
             /* Remove and re-insert when score changed. */
-            if (score != curscore &&  
+            if (score != curscore &&
                 /* LT? Only update if score is less than current. */
                 (!lt || score < curscore) &&
                 /* GT? Only update if score is greater than current. */
-                (!gt || score > curscore)) 
+                (!gt || score > curscore))
             {
                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
                 zobj->ptr = zzlInsert(zobj->ptr,ele,score);
@@ -1404,11 +1419,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
 
             /* Remove and re-insert when score changes. */
-            if (score != curscore &&  
+            if (score != curscore &&
                 /* LT? Only update if score is less than current. */
                 (!lt || score < curscore) &&
                 /* GT? Only update if score is greater than current. */
-                (!gt || score > curscore)) 
+                (!gt || score > curscore))
             {
                 znode = zslUpdateScore(zs->zsl,curscore,ele,score);
                 /* Note that we did not removed the original element from
@@ -1600,7 +1615,7 @@ void zaddGenericCommand(client *c, int flags) {
             "XX and NX options at the same time are not compatible");
         return;
     }
-    
+
     if ((gt && nx) || (lt && nx) || (gt && lt)) {
         addReplyError(c,
             "GT, LT, and/or NX options at the same time are not compatible");
