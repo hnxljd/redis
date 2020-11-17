@@ -777,89 +777,61 @@ static unsigned long rev(unsigned long v) {
     return v;
 }
 
-/* dictScan() is used to iterate over the elements of a dictionary.
+/*
+ * 说明
  *
- * Iterating works the following way:
+ * dictScan（）用于迭代字典的元素
+ * 迭代的工作方式如下:
+ * 1) 使用游标(cursor = v = 0) 调用该函数
+ * 2) 该函数执行迭代的第一步, 并返回您在下一次调用中必须使用的新游标
+ * 3) 结束时返回 新游标 0
  *
- * 1) Initially you call the function using a cursor (v) value of 0.
- * 2) The function performs one step of the iteration, and returns the
- *    new cursor value you must use in the next call.
- * 3) When the returned cursor is 0, the iteration is complete.
+ * 方法保证在迭代开始到结束的每个元素都会被返回至少一次, 可能多次
  *
- * The function guarantees all elements present in the
- * dictionary get returned between the start and end of the iteration.
- * However it is possible some elements get returned multiple times.
+ * 原理
  *
- * For every element returned, the callback argument 'fn' is
- * called with 'privdata' as first argument and the dictionary entry
- * 'de' as second argument.
+ * 迭代算法由Pieter Noordhuis 设计
+ * 主要思想是从高阶位开始增加 cursor
+ * 即, 不是正常地增加cursor, 而是将 cursor 的位反转, 然后使 cursor 递增, 最后再次反转位
+ * 这种设计是为了支持在迭代时 rehash, 缩扩容
  *
- * HOW IT WORKS.
+ * dict.c 哈希表的大小始终是 2^n, 冲突时使用单链表连接
+ * Index key = hash(key) & MASK (MASK = SIZE - 1)
  *
- * The iteration algorithm was designed by Pieter Noordhuis.
- * The main idea is to increment a cursor starting from the higher order
- * bits. That is, instead of incrementing the cursor normally, the bits
- * of the cursor are reversed, then the cursor is incremented, and finally
- * the bits are reversed again.
+ * rehash 时会发生什么(可能扩容也可能缩容)
  *
- * This strategy is needed because the hash table may be resized between
- * iteration calls.
+ * (? = 0 和 1 两种情况并存)
+ * 如果扩容, 元素可以通过偏移原桶大小的倍数找到目标桶
+ * 假设目前 cursor 是 1100 mask 是 1111 (size = 16 )
+
+ * 如果扩容至 64, newMask = 11_1111, 所以新的 index 可能是 ??_1100
+ * 由于计数器是反向的, 所以会先迭代较高的位, 所以扩容时, 游标不需要重新开始
+ * 它将使用没有结尾的1100游标继续进行迭代, 并且也不会探索最后4位的任何其他组合
  *
- * dict.c hash tables are always power of two in size, and they
- * use chaining, so the position of an element in a given table is given
- * by computing the bitwise AND between Hash(key) and SIZE-1
- * (where SIZE-1 is always the mask that is equivalent to taking the rest
- *  of the division between the Hash of the key and SIZE).
+ * 如果缩容至 8, newMask = 111, 因为已经完全遍历了低三位的组合 (?100), 所以不会也不需要再次访问同一个 index
  *
- * For example if the current hash table size is 16, the mask is
- * (in binary) 1111. The position of a key in the hash table will always be
- * the last four bits of the hash output, and so forth.
+ * 但是 rehash 的时候, 其实有 ht[0] 和 ht[1] 两个 hash 表
+ * 所以 Redis 总是先迭代较小的表, 然后再测试当前游标对较大表的所有组合, 即 ? 的情况
+ * 例如, cursor = 101, ht[1].size = 16, ht[1] 尝试获取 0_101 和 1_101
+ * 这样只需要处理一个小表, 大表只是小表数据的补充
  *
- * WHAT HAPPENS IF THE TABLE CHANGES IN SIZE?
+ * 局限性
  *
- * If the hash table grows, elements can go anywhere in one multiple of
- * the old bucket: for example let's say we already iterated with
- * a 4 bit cursor 1100 (the mask is 1111 because hash table size = 16).
+ * 迭代器是无状态的，且不需要额外的内存。
  *
- * If the hash table will be resized to 64 elements, then the new mask will
- * be 111111. The new buckets you obtain by substituting in ??1100
- * with either 0 or 1 can be targeted only by keys we already visited
- * when scanning the bucket 1100 in the smaller hash table.
+ * 缺点
  *
- * By iterating the higher bits first, because of the inverted counter, the
- * cursor does not need to restart if the table size gets bigger. It will
- * continue iterating using cursors without '1100' at the end, and also
- * without any other combination of the final 4 bits already explored.
+ * 1) 结果可能返回多次, 需要程序自行处理
+ * 2) 迭代器每次调用必须返回多个元素, 两个原因:
+ *      1. 一个 bucket 可能有多个元素(冲突时)
+ *      2. 需要获取大表数据作为补充(防止因为 rehash 而丢失元素)
+ * 3) 反向 cursor 可能有些难以理解, 但还好有注释
  *
- * Similarly when the table size shrinks over time, for example going from
- * 16 to 8, if a combination of the lower three bits (the mask for size 8
- * is 111) were already completely explored, it would not be visited again
- * because we are sure we tried, for example, both 0111 and 1111 (all the
- * variations of the higher bit) so we don't need to test it again.
- *
- * WAIT... YOU HAVE *TWO* TABLES DURING REHASHING!
- *
- * Yes, this is true, but we always iterate the smaller table first, then
- * we test all the expansions of the current cursor into the larger
- * table. For example if the current cursor is 101 and we also have a
- * larger table of size 16, we also test (0)101 and (1)101 inside the larger
- * table. This reduces the problem back to having only one table, where
- * the larger one, if it exists, is just an expansion of the smaller one.
- *
- * LIMITATIONS
- *
- * This iterator is completely stateless, and this is a huge advantage,
- * including no additional memory used.
- *
- * The disadvantages resulting from this design are:
- *
- * 1) It is possible we return elements more than once. However this is usually
- *    easy to deal with in the application level.
- * 2) The iterator must return multiple elements per call, as it needs to always
- *    return all the keys chained in a given bucket, and all the expansions, so
- *    we are sure we don't miss keys moving during rehashing.
- * 3) The reverse cursor is somewhat hard to understand at first, but this
- *    comment is supposed to help.
+ * d 是字典
+ * v 是 cursor
+ * fn 是获取元素的方法
+ * bucketfn 用于整理桶碎片(todo 暂时不知道作用)
+ * privdata fn 所需参数
  */
 unsigned long dictScan(dict *d,
                        unsigned long v,
@@ -867,43 +839,48 @@ unsigned long dictScan(dict *d,
                        dictScanBucketFunction* bucketfn,
                        void *privdata)
 {
+    /* 两个 hash 表 */
     dictht *t0, *t1;
     const dictEntry *de, *next;
     unsigned long m0, m1;
 
     if (dictSize(d) == 0) return 0;
 
-    /* Having a safe iterator means no rehashing can happen, see _dictRehashStep.
-     * This is needed in case the scan callback tries to do dictFind or alike. */
+    /*
+     * 拥有安全的迭代器意味着无法进行任何重新哈希处理, 请参见_dictRehashStep
+     * 如果扫描回调试图执行 dictFind 或类似操作, 则需要此方法 todo 暂不理解
+     */
     d->iterators++;
 
     if (!dictIsRehashing(d)) {
+        /* 当前没有 rehash 所以只有一个表 */
         t0 = &(d->ht[0]);
         m0 = t0->sizemask;
 
-        /* Emit entries at cursor */
         if (bucketfn) bucketfn(privdata, &t0->table[v & m0]);
+        /* 通过游标获取元素 */
         de = t0->table[v & m0];
         while (de) {
+            /* 桶内是单链表 */
             next = de->next;
             fn(privdata, de);
             de = next;
         }
 
-        /* Set unmasked bits so incrementing the reversed cursor
-         * operates on the masked bits */
+        /* 屏蔽高位以增加 反向 cursor */
         v |= ~m0;
 
-        /* Increment the reverse cursor */
+        /* 增加反向 cursor */
         v = rev(v);
         v++;
         v = rev(v);
 
     } else {
+        /* 在 rehash 所以有两个表 */
         t0 = &d->ht[0];
         t1 = &d->ht[1];
 
-        /* Make sure t0 is the smaller and t1 is the bigger table */
+        /* 确保 t0 是小表 */
         if (t0->size > t1->size) {
             t0 = &d->ht[1];
             t1 = &d->ht[0];
@@ -912,7 +889,7 @@ unsigned long dictScan(dict *d,
         m0 = t0->sizemask;
         m1 = t1->sizemask;
 
-        /* Emit entries at cursor */
+        /* 通过游标获取元素 */
         if (bucketfn) bucketfn(privdata, &t0->table[v & m0]);
         de = t0->table[v & m0];
         while (de) {
@@ -921,10 +898,9 @@ unsigned long dictScan(dict *d,
             de = next;
         }
 
-        /* Iterate over indices in larger table that are the expansion
-         * of the index pointed to by the cursor in the smaller table */
+        /* 迭代大表中的索引, 作为小表的扩展* */
         do {
-            /* Emit entries at cursor */
+            /* 通过游标获取元素 */
             if (bucketfn) bucketfn(privdata, &t1->table[v & m1]);
             de = t1->table[v & m1];
             while (de) {
@@ -933,13 +909,13 @@ unsigned long dictScan(dict *d,
                 de = next;
             }
 
-            /* Increment the reverse cursor not covered by the smaller mask.*/
+            /* 屏蔽大表 mask 的高位(补充小表的 mask 没有覆盖的位)以增加 反向 cursor */
             v |= ~m1;
             v = rev(v);
             v++;
             v = rev(v);
 
-            /* Continue while bits covered by mask difference is non-zero */
+            /* 掩码差异覆盖的位不为零时继续, 即可能把所有 ? 都处理到 */
         } while (v & (m0 ^ m1));
     }
 
